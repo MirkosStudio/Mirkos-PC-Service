@@ -2,6 +2,7 @@
 // Mirkos PC Services (MPS) v2.5
 // - 基于 v2.2（SHA256 密钥 + 被动模式）
 // - 插件可安全接管主逻辑（需提供原始密钥）
+// - 修复 MinGW 编译兼容性（ANSI 字符串）
 // ========================
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0601  // Windows 7
@@ -41,7 +42,6 @@
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "bcrypt.lib")
-#include "plugin_api.h"
 
 // ========================
 // 配置常量
@@ -381,7 +381,8 @@ std::string GetCPUUsage() {
     static bool initialized = false;
     if (!initialized) {
         PdhOpenQuery(nullptr, 0, &cpuQuery);
-        PdhAddCounter(cpuQuery, L"\\Processor(_Total)\\% Processor Time", 0, &cpuTotal);
+        // 修复 MinGW 兼容性：使用 ANSI 字符串，而非宽字符
+        PdhAddCounter(cpuQuery, "\\Processor(_Total)\\% Processor Time", 0, &cpuTotal);
         PdhCollectQueryData(cpuQuery);
         initialized = true;
         Sleep(1000);
@@ -785,6 +786,8 @@ DWORD WINAPI IdleMonitorThreadProc(LPVOID) {
 // ========================
 // 插件系统（带弹窗错误提示）
 // ========================
+// 为兼容 MinGW，不通过 plugin_api.h 声明 RegisterLogHandler
+// 插件开发者需自行声明：extern "C" __declspec(dllimport) bool RegisterLogHandler(...);
 void LoadPlugins() {
     std::filesystem::create_directories(EXTENSIONS_DIR);
     for (const auto& entry : std::filesystem::directory_iterator(EXTENSIONS_DIR)) {
@@ -797,6 +800,7 @@ void LoadPlugins() {
                 MessageBoxA(nullptr, msg.c_str(), "MPS Plugin Error", MB_ICONERROR | MB_OK | MB_SYSTEMMODAL);
                 continue;
             }
+            typedef bool (*PluginInitFunc)();
             PluginInitFunc init = (PluginInitFunc)GetProcAddress(hMod, "PluginInit");
             if (!init) {
                 std::string msg = "Plugin missing PluginInit export:\n" + pluginName;
@@ -823,6 +827,12 @@ bool TryHandleWithPlugins(
     const std::vector<std::string>& args,
     std::string& response
 ) {
+    typedef bool (*PluginHandleCommandFunc)(
+        const std::string& cmd,
+        DWORD pid,
+        const std::vector<std::string>& args,
+        std::string& response
+    );
     for (auto& [name, hMod] : loadedPlugins) {
         PluginHandleCommandFunc handler = (PluginHandleCommandFunc)GetProcAddress(hMod, "PluginHandleCommand");
         if (handler) {
