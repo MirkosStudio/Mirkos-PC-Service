@@ -1,15 +1,11 @@
 // ========================
-// 安全增强版 Mirkos PC Services (MPS) v2.2
-// - 默认静默，无后台行为
-// - 密钥仅存哈希
-// - 支持 self_update / log_level / idle_shutdown
+// Mirkos PC Services (MPS) v2.5
+// - 基于 v2.2（SHA256 密钥 + 被动模式）
+// - 插件可安全接管主逻辑（需提供原始密钥）
 // ========================
-
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0601  // Windows 7
 #define WINVER 0x0601
-
-// 必须先包含 winsock2.h
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -36,8 +32,6 @@
 #include <cstdlib>
 #include <cctype>
 #include <algorithm>
-
-// 链接库
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -47,15 +41,15 @@
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "bcrypt.lib")
-
 #include "plugin_api.h"
 
 // ========================
 // 配置常量
 // ========================
-// 明文密钥（仅注释保留）: "4D69726B6F73205043205365727669636573" -> "Mirkos PC Services"
-const std::string EXPECTED_AUTH_HASH = "2be04e024ebc49a3c034c76ff5cd6eae63bdb158beb1155a86b582c2d0769a86";
 
+// 这是用于所有认证的原始密钥（48 字节十六进制字符串）
+// 其 SHA256 哈希为: 2be04e024ebc49a3c034c76ff5cd6eae63bdb158beb1155a86b582c2d0769a86
+const std::string EXPECTED_AUTH_HASH = "2be04e024ebc49a3c034c76ff5cd6eae63bdb158beb1155a86b582c2d0769a86";
 const char* SECURE_PIPE = "\\\\.\\pipe\\MPSControl";
 const char* USER_PIPE = "\\\\.\\pipe\\MPSUser";
 const char* EXTENSIONS_DIR = "MPS_Extensions";
@@ -76,26 +70,27 @@ std::set<std::string> maliciousDomains;
 std::set<std::string> maliciousIPs;
 std::set<std::string> phishingURLs;
 time_t lastThreatUpdate = 0;
-
 // 功能开关
 volatile bool monitorEnabled = false;
 volatile bool threatUpdateEnabled = false;
-
 // 日志级别：0=INFO, 1=DEBUG
 int logLevel = 0;
-
 // 空闲自动退出（秒，0=禁用）
 DWORD idleTimeoutSeconds = 0;
 time_t lastCommandTime = time(nullptr);
-
 CRITICAL_SECTION logLock;
 CRITICAL_SECTION threatLock;
 
 // ========================
-// 日志记录（带级别）
+// 可被插件接管的日志处理器
 // ========================
-void LogMessage(const std::string& level, const std::string& msg) {
-    if (level == "DEBUG" && logLevel < 1) return;
+using LogHandlerFn = void(*)(const char* level, const char* msg);
+LogHandlerFn g_CustomLogHandler = nullptr;
+
+// ========================
+// 默认日志实现
+// ========================
+void DefaultLogHandler(const std::string& level, const std::string& msg) {
     EnterCriticalSection(&logLock);
     std::filesystem::create_directories(LOGS_DIR);
     std::ofstream log((std::string(LOGS_DIR) + "\\mps.log").c_str(), std::ios::app);
@@ -107,6 +102,18 @@ void LogMessage(const std::string& level, const std::string& msg) {
         log.close();
     }
     LeaveCriticalSection(&logLock);
+}
+
+// ========================
+// 统一日志调用入口
+// ========================
+void LogMessage(const std::string& level, const std::string& msg) {
+    if (level == "DEBUG" && logLevel < 1) return;
+    if (g_CustomLogHandler) {
+        g_CustomLogHandler(level.c_str(), msg.c_str());
+    } else {
+        DefaultLogHandler(level, msg);
+    }
 }
 #define LogInfo(msg) LogMessage("INFO", msg)
 #define LogDebug(msg) LogMessage("DEBUG", msg)
@@ -121,30 +128,21 @@ std::string ComputeSHA256(const std::string& input) {
     DWORD hashLength = 0;
     DWORD resultLength = 0;
     std::vector<BYTE> hash;
-
     status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
     if (!BCRYPT_SUCCESS(status)) goto cleanup;
-
     status = BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, (PBYTE)&hashLength, sizeof(hashLength), &resultLength, 0);
     if (!BCRYPT_SUCCESS(status)) goto cleanup;
-
     hash.resize(hashLength);
-
     status = BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0);
     if (!BCRYPT_SUCCESS(status)) goto cleanup;
-
     status = BCryptHashData(hHash, (PBYTE)input.data(), (ULONG)input.size(), 0);
     if (!BCRYPT_SUCCESS(status)) goto cleanup;
-
     status = BCryptFinishHash(hHash, hash.data(), hashLength, 0);
     if (!BCRYPT_SUCCESS(status)) goto cleanup;
-
 cleanup:
     if (hHash) BCryptDestroyHash(hHash);
     if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
-
     if (!BCRYPT_SUCCESS(status)) return "";
-
     static const char hexChars[] = "0123456789abcdef";
     std::string hexHash;
     hexHash.reserve(hashLength * 2);
@@ -153,6 +151,24 @@ cleanup:
         hexHash += hexChars[b & 0xF];
     }
     return hexHash;
+}
+
+// ========================
+// 插件注册日志处理器（需提供原始明文密钥）
+// ========================
+extern "C" __declspec(dllexport) bool RegisterLogHandler(
+    const char* plugin_auth_key,
+    LogHandlerFn custom_logger
+) {
+    if (!plugin_auth_key || std::string(plugin_auth_key).empty()) {
+        return false;
+    }
+    std::string computed = ComputeSHA256(plugin_auth_key);
+    if (computed != EXPECTED_AUTH_HASH) {
+        return false; // 密钥错误
+    }
+    g_CustomLogHandler = custom_logger;
+    return true;
 }
 
 // ========================
@@ -287,7 +303,7 @@ void UpdateThreatFeeds() {
 }
 
 // ========================
-// 系统工具函数（全部保留）
+// 系统工具函数
 // ========================
 std::string GetBatteryStatus() {
     SYSTEM_POWER_STATUS sps;
@@ -500,8 +516,8 @@ std::string ControlService(const std::string& serviceName, const std::string& ac
             result = (status.dwCurrentState == SERVICE_RUNNING) ? "RUNNING" : "STOPPED";
         } else result = "UNKNOWN";
     }
-    CloseServiceHandle(hService);
-    CloseServiceHandle(hSCM);
+    CloseHandle(hService);
+    CloseHandle(hSCM);
     return result;
 }
 void PlayAudioFile(const std::string& filePath) {
@@ -653,11 +669,9 @@ std::string CaptureScreen(const std::string& filePath) {
 // ========================
 bool SelfUpdateFromURL(const std::string& url) {
     if (url.substr(0, 8) != "https://") return false;
-
     std::string newExe = "mps_update.tmp";
     HINTERNET hSession = WinHttpOpen(L"MPS-Updater/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, 0);
     if (!hSession) return false;
-
     URL_COMPONENTS urlComp = {0};
     urlComp.dwStructSize = sizeof(urlComp);
     urlComp.dwSchemeLength = (DWORD)-1;
@@ -669,20 +683,16 @@ bool SelfUpdateFromURL(const std::string& url) {
         WinHttpCloseHandle(hSession);
         return false;
     }
-
     HINTERNET hConnect = WinHttpConnect(hSession, urlComp.lpszHostName, 443, 0);
     if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
-
     HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", urlComp.lpszUrlPath, nullptr, WINHTTP_NO_REFERER,
                                            WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
     if (!hRequest || !WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0)) {
         WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false;
     }
-
     WinHttpReceiveResponse(hRequest, nullptr);
     std::ofstream outFile(newExe, std::ios::binary);
     if (!outFile) { WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
-
     char buffer[8192];
     DWORD bytesRead;
     while (WinHttpReadData(hRequest, buffer, sizeof(buffer), &bytesRead) && bytesRead > 0) {
@@ -692,7 +702,6 @@ bool SelfUpdateFromURL(const std::string& url) {
     WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
-
     // 验证是否为有效PE文件（简单检查 DOS 头）
     std::ifstream verify(newExe, std::ios::binary);
     char magic[2];
@@ -702,7 +711,6 @@ bool SelfUpdateFromURL(const std::string& url) {
         std::filesystem::remove(newExe);
         return false;
     }
-
     // 启动更新脚本（避免自身文件被占用）
     std::string cmd = "timeout /t 2 >nul && move /y \"" + newExe + "\" \"" + EXE_NAME + "\" && \"" + EXE_NAME + "\"";
     STARTUPINFOA si = { sizeof(si) };
@@ -750,7 +758,6 @@ DWORD WINAPI ProtectionMonitorThreadProc(LPVOID) {
     LogInfo("Protection monitor stopped.");
     return 0;
 }
-
 DWORD WINAPI ThreatUpdateThreadProc(LPVOID) {
     LogInfo("Threat update thread started.");
     if (threatUpdateEnabled) UpdateThreatFeeds();
@@ -761,7 +768,6 @@ DWORD WINAPI ThreatUpdateThreadProc(LPVOID) {
     LogInfo("Threat update thread stopped.");
     return 0;
 }
-
 DWORD WINAPI IdleMonitorThreadProc(LPVOID) {
     while (true) {
         Sleep(10000); // 每10秒检查
@@ -777,26 +783,40 @@ DWORD WINAPI IdleMonitorThreadProc(LPVOID) {
 }
 
 // ========================
-// 插件系统
+// 插件系统（带弹窗错误提示）
 // ========================
 void LoadPlugins() {
     std::filesystem::create_directories(EXTENSIONS_DIR);
     for (const auto& entry : std::filesystem::directory_iterator(EXTENSIONS_DIR)) {
         if (entry.path().extension() == ".dll") {
+            std::string pluginName = entry.path().filename().string();
             HMODULE hMod = LoadLibraryW(entry.path().c_str());
-            if (hMod) {
-                PluginInitFunc init = (PluginInitFunc)GetProcAddress(hMod, "PluginInit");
-                if (init && init()) {
-                    loadedPlugins[entry.path().filename().string()] = hMod;
-                    LogInfo("Loaded plugin: " + entry.path().filename().string());
-                } else {
-                    FreeLibrary(hMod);
-                }
+            if (!hMod) {
+                std::string msg = "Failed to load plugin DLL:\n" + pluginName;
+                LogMessage("ERROR", msg);
+                MessageBoxA(nullptr, msg.c_str(), "MPS Plugin Error", MB_ICONERROR | MB_OK | MB_SYSTEMMODAL);
+                continue;
             }
+            PluginInitFunc init = (PluginInitFunc)GetProcAddress(hMod, "PluginInit");
+            if (!init) {
+                std::string msg = "Plugin missing PluginInit export:\n" + pluginName;
+                LogMessage("ERROR", msg);
+                MessageBoxA(nullptr, msg.c_str(), "MPS Plugin Error", MB_ICONERROR | MB_OK | MB_SYSTEMMODAL);
+                FreeLibrary(hMod);
+                continue;
+            }
+            if (!init()) {
+                std::string msg = "Plugin initialization failed:\n" + pluginName;
+                LogMessage("ERROR", msg);
+                MessageBoxA(nullptr, msg.c_str(), "MPS Plugin Error", MB_ICONERROR | MB_OK | MB_SYSTEMMODAL);
+                FreeLibrary(hMod);
+                continue;
+            }
+            loadedPlugins[pluginName] = hMod;
+            LogInfo("Loaded plugin: " + pluginName);
         }
     }
 }
-
 bool TryHandleWithPlugins(
     const std::string& cmd,
     DWORD pid,
@@ -886,7 +906,6 @@ bool HandleUserCommand(const std::string& cmd, DWORD /*pid*/, const std::vector<
     }
     return false;
 }
-
 bool HandleSecureCommand(const std::string& cmd, DWORD pid, const std::vector<std::string>& args, std::string& response) {
     // === 新增功能 ===
     if (cmd == "enable" && args.size() >= 1) {
@@ -909,7 +928,6 @@ bool HandleSecureCommand(const std::string& cmd, DWORD pid, const std::vector<st
             return true;
         }
     }
-
     if (cmd == "disable" && args.size() >= 1) {
         if (args[0] == "protection_monitor") {
             monitorEnabled = false;
@@ -924,7 +942,6 @@ bool HandleSecureCommand(const std::string& cmd, DWORD pid, const std::vector<st
             return true;
         }
     }
-
     if (cmd == "self_update" && args.size() >= 1) {
         if (SelfUpdateFromURL(args[0])) {
             response = "OK: Update started, service will restart.";
@@ -935,7 +952,6 @@ bool HandleSecureCommand(const std::string& cmd, DWORD pid, const std::vector<st
         }
         return true;
     }
-
     if (cmd == "log_level" && args.size() >= 1) {
         if (args[0] == "debug") { logLevel = 1; response = "OK: Log level = DEBUG"; }
         else if (args[0] == "info") { logLevel = 0; response = "OK: Log level = INFO"; }
@@ -943,7 +959,6 @@ bool HandleSecureCommand(const std::string& cmd, DWORD pid, const std::vector<st
         LogInfo("Log level set to: " + args[0]);
         return true;
     }
-
     if (cmd == "idle_shutdown" && args.size() >= 1) {
         try {
             idleTimeoutSeconds = std::stoul(args[0]);
@@ -954,7 +969,6 @@ bool HandleSecureCommand(const std::string& cmd, DWORD pid, const std::vector<st
         }
         return true;
     }
-
     // === 原有命令 ===
     if (cmd == "protect") {
         if (pid) {
@@ -1007,7 +1021,7 @@ bool HandleSecureCommand(const std::string& cmd, DWORD pid, const std::vector<st
         GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
         double memMB = pmc.WorkingSetSize / (1024.0 * 1024.0);
         std::ostringstream oss;
-        oss << "Mirkos PC Services v2.2 (Passive Mode)\n";
+        oss << "Mirkos PC Services v2.5 (Passive Mode)\n";
         oss << "Uptime: " << (time(nullptr) - serviceStartTime) << " seconds\n";
         oss << "Memory Usage: " << std::fixed << std::setprecision(2) << memMB << " MB\n";
         oss << "Protected Processes: " << protectedPids.size() << "\n";
@@ -1111,7 +1125,6 @@ void HandlePipeRequest(HANDLE hPipe, bool isSecure) {
     std::istringstream iss(buffer);
     std::string response;
     bool handled = false;
-
     if (isSecure) {
         std::string providedKey, cmd, pidStr;
         iss >> providedKey;
@@ -1150,13 +1163,11 @@ void HandlePipeRequest(HANDLE hPipe, bool isSecure) {
             handled = true;
         }
     }
-
     if (!handled) {
         response = "ERROR: Unknown command";
     }
     WriteFile(hPipe, response.c_str(), (DWORD)response.size(), nullptr, nullptr);
 }
-
 DWORD WINAPI SecurePipeThreadProc(LPVOID) {
     while (true) {
         HANDLE hPipe = CreateNamedPipeA(
@@ -1174,7 +1185,6 @@ DWORD WINAPI SecurePipeThreadProc(LPVOID) {
     }
     return 0;
 }
-
 DWORD WINAPI UserPipeThreadProc(LPVOID) {
     while (true) {
         HANDLE hPipe = CreateNamedPipeA(
@@ -1205,27 +1215,20 @@ int main() {
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     std::filesystem::path exeDir = std::filesystem::path(exePath).parent_path();
     SetCurrentDirectoryW(exeDir.c_str());
-
     InitializeCriticalSection(&logLock);
     InitializeCriticalSection(&threatLock);
-
     std::filesystem::create_directories(EXTENSIONS_DIR);
     std::filesystem::create_directories(INJECTABLES_DIR);
     std::filesystem::create_directories(MEDIA_DIR);
     std::filesystem::create_directories(SCRIPTS_DIR);
     std::filesystem::create_directories(LOGS_DIR);
-
     LoadPlugins();
-
     // 仅监听管道 + 空闲监控
     CreateThread(nullptr, 0, SecurePipeThreadProc, nullptr, 0, nullptr);
     CreateThread(nullptr, 0, UserPipeThreadProc, nullptr, 0, nullptr);
     CreateThread(nullptr, 0, IdleMonitorThreadProc, nullptr, 0, nullptr);
-
-    LogInfo("MPS Service v2.2 (Passive Mode) started. Awaiting commands...");
-
+    LogInfo("MPS Service v2.5 (Passive Mode) started. Awaiting commands...");
     Sleep(INFINITE);
-
     DeleteCriticalSection(&logLock);
     DeleteCriticalSection(&threatLock);
     WSACleanup();
